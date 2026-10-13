@@ -10,8 +10,12 @@ import type { ReaderDocument } from './types';
 const API = 'https://mineru.net/api/v4';
 export const CACHE_SIGNATURE = 'mineru-cloud-vlm-content-list-v1-reader-v6';
 export const PDF_RESOURCE_OPTIONS = { cMapUrl: '/lib/pdfjs/cmaps/', cMapPacked: true, standardFontDataUrl: '/lib/pdfjs/standard_fonts/', wasmUrl: '/lib/pdfjs/wasm/', iccUrl: '/lib/pdfjs/iccs/', isEvalSupported: false };
-export interface CachedReader { document: ReaderDocument; directory: string; contentBase: string; assets: string[] }
+export interface CachedReader { document: ReaderDocument; directory: string; contentBase: string; assets: string[]; assetDimensions?: Record<string, { width: number; height: number }> }
 interface PendingJob { batchId: string; uploaded: boolean }
+interface FileVersion { path: string; mtime: number; size: number }
+interface MemoryReader { version: FileVersion; reader: CachedReader }
+interface FileJob { promise: Promise<CachedReader>; listeners: Set<(status: string) => void>; status?: string }
+const MEMORY_DOCUMENT_LIMIT = 8;
 
 export function resolveAssetReference(reference: string, contentBase: string, assets: string[]): string | undefined {
   if (!reference || /^(?:[a-z]+:|\/|\\)/i.test(reference)) return undefined;
@@ -40,12 +44,66 @@ export function unpackResult(bytes: Uint8Array): { items: unknown; entries: Reco
 export class ReaderService {
   private jobs = new Map<string, Promise<CachedReader>>();
   private listeners = new Map<string, Set<(status: string) => void>>();
+  private fileJobs = new Map<string, FileJob>();
+  private memoryReaders = new Map<string, MemoryReader>();
   private stopped = false;
   constructor(private app: App, readonly pluginDirectory: string, private token: () => string | null) {}
 
-  stop(): void { this.stopped = true; this.listeners.clear(); }
+  stop(): void {
+    this.stopped = true;
+    this.listeners.clear();
+    for (const job of this.fileJobs.values()) job.listeners.clear();
+    this.fileJobs.clear();
+    this.memoryReaders.clear();
+  }
 
   async getDocument(file: TFile, status: (message: string) => void): Promise<CachedReader> {
+    if (this.stopped) throw new Error('插件已关闭，请重新开启阅读模式。');
+    const version: FileVersion = { path: file.path, mtime: file.stat.mtime, size: file.stat.size };
+    const cached = this.memoryReaders.get(version.path);
+    if (cached) {
+      this.memoryReaders.delete(version.path);
+      if (cached.version.mtime === version.mtime && cached.version.size === version.size) {
+        this.memoryReaders.set(version.path, cached);
+        status('已载入离线阅读缓存');
+        return cached.reader;
+      }
+    }
+    const key = JSON.stringify([version.path, version.mtime, version.size]);
+    let job = this.fileJobs.get(key);
+    if (!job) {
+      const created: FileJob = {
+        listeners: new Set(),
+        // Register the file task before reading bytes, so simultaneous tabs
+        // also share the read and hash rather than only the parser request.
+        promise: Promise.resolve().then(async () => {
+          const reader = await this.loadDocument(file, message => {
+            created.status = message;
+            created.listeners.forEach(fn => fn(message));
+          });
+          // A changed file must not let an older in-flight task replace the
+          // current memory entry after it finishes.
+          const current = this.app.vault.getAbstractFileByPath(version.path) as TFile | null;
+          if (!this.stopped && current?.stat?.mtime === version.mtime && current.stat.size === version.size) {
+            this.memoryReaders.delete(version.path);
+            this.memoryReaders.set(version.path, { version, reader });
+            if (this.memoryReaders.size > MEMORY_DOCUMENT_LIMIT) this.memoryReaders.delete(this.memoryReaders.keys().next().value!);
+          }
+          return reader;
+        }).finally(() => {
+          if (this.fileJobs.get(key) === created) this.fileJobs.delete(key);
+        }),
+      };
+      this.fileJobs.set(key, created);
+      job = created;
+    }
+    job.listeners.add(status);
+    if (job.status) status(job.status);
+    try { return await job.promise; }
+    finally { job.listeners.delete(status); }
+  }
+
+  private async loadDocument(file: TFile, status: (message: string) => void): Promise<CachedReader> {
     const binary = await this.app.vault.readBinary(file);
     const hash = createHash('sha256').update(new Uint8Array(binary)).digest('hex');
     const listeners = this.listeners.get(hash) ?? new Set<(status: string) => void>();
@@ -56,7 +114,11 @@ export class ReaderService {
       this.jobs.set(hash, job);
     }
     try { return await job; }
-    finally { listeners.delete(status); if (this.jobs.get(hash) === job) this.jobs.delete(hash); }
+    finally {
+      listeners.delete(status);
+      if (!listeners.size && this.listeners.get(hash) === listeners) this.listeners.delete(hash);
+      if (this.jobs.get(hash) === job) this.jobs.delete(hash);
+    }
   }
 
   private async process(file: TFile, binary: ArrayBuffer, hash: string, status: (message: string) => void): Promise<CachedReader> {

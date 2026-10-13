@@ -52,12 +52,16 @@ const renderer = build({
   return await import(`data:text/javascript;base64,${Buffer.from(code).toString("base64")}`) as typeof import("../src/render.js");
 });
 
-async function render(blocks: ReaderBlock[], invalidFormula?: string, extraOptions: Partial<ReaderRenderOptions> = {}) {
+async function render(
+  blocks: ReaderBlock[], invalidFormula?: string, extraOptions: Partial<ReaderRenderOptions> = {},
+  beforeRender?: (root: HTMLElement) => void,
+) {
   const { document: dom } = parseHTML("<!doctype html><html><head></head><body></body></html>");
   const document = dom as unknown as Document;
   const root = document.createElement("div");
   document.body.append(root);
   harnessGlobal.__readerHarness = { document, calls: [], loaded: false, invalidFormula };
+  beforeRender?.(root);
   const reader: ReaderDocument = { schemaVersion: 1, sourceHash: "test", parserSignature: "test", pageCount: 2, blocks, warnings: [] };
   const options: ReaderRenderOptions = { fontSize: 18, lineHeight: 1.5, assetUrl: () => "", onSource: () => {}, onCopy: () => {}, onZoom: () => {}, ...extraOptions };
   await (await renderer).renderReader(root, reader, options);
@@ -228,4 +232,185 @@ test("figure OCR text is omitted while real captions, footnotes and numbered cap
   assert.ok(image.alt.includes("random axis labels"));
   image.dispatchEvent(new root.ownerDocument.defaultView!.Event("click"));
   assert.deepEqual(zoomCaptions, ["Fig. 1. Network structure."]);
+});
+
+test("lazy figure and equation images reserve supplied dimensions without decoding", async () => {
+  let decodes = 0;
+  const dimensionsRequested: string[] = [];
+  const { root } = await render([
+    block("figure", "figure", "", { asset: "figure.png" }),
+    block("equation", "equation", "$$invalid$$", { asset: "equation.png" }),
+  ], "invalid", {
+    assetUrl: reference => `app://local/${reference}`,
+    assetDimensions: reference => { dimensionsRequested.push(reference); return { width: 900, height: 450 }; },
+  }, root => {
+    const document = root.ownerDocument;
+    const create = document.createElement.bind(document);
+    document.createElement = ((name: string, options?: ElementCreationOptions) => {
+      const element = create(name, options);
+      if (name === "img") Object.defineProperty(element, "decode", { value: () => { decodes++; return new Promise(() => {}); } });
+      return element;
+    }) as Document["createElement"];
+  });
+  assert.equal(decodes, 0);
+  assert.deepEqual(dimensionsRequested, ["figure.png", "equation.png"]);
+  for (const image of Array.from(root.querySelectorAll<HTMLImageElement>("img"))) {
+    assert.equal(image.loading, "lazy");
+    assert.equal(image.getAttribute("width"), "900");
+    assert.equal(image.getAttribute("height"), "450");
+    assert.equal(image.style.aspectRatio, "900 / 450");
+    assert.equal(image.dataset.readerLayoutReserved, "true");
+  }
+});
+
+test("an image with no header dimensions learns its natural ratio on load", async () => {
+  const { root } = await render([block("figure", "figure", "", { asset: "figure.png" })], undefined, {
+    assetUrl: () => "app://local/figure.png",
+  });
+  const image = root.querySelector<HTMLImageElement>("img")!;
+  assert.equal(image.getAttribute("width"), null);
+  Object.defineProperties(image, { naturalWidth: { value: 640 }, naturalHeight: { value: 320 } });
+  image.dispatchEvent(new root.ownerDocument.defaultView!.Event("load"));
+  assert.equal(image.getAttribute("width"), "640");
+  assert.equal(image.getAttribute("height"), "320");
+  assert.equal(image.style.aspectRatio, "640 / 320");
+  assert.notEqual(image.dataset.readerLayoutReserved, "true");
+});
+
+test("text-only documents do not wait for MathJax", async () => {
+  const { harness } = await render([block("body", "paragraph", "A paragraph without formulas.")]);
+  assert.deepEqual(harness.calls, []);
+});
+
+test("long rendering yields with partial DOM while keeping every formula and source block", async () => {
+  let partialBlocks = -1;
+  const blocks = Array.from({ length: 125 }, (_, index) => block(`body-${index}`, "paragraph", `Formula $x_${index}=1$.`));
+  const { root, harness } = await render(blocks, undefined, {}, root => {
+    setTimeout(() => { partialBlocks = root.querySelectorAll("[data-reader-block-id]").length; }, 0);
+  });
+  assert.ok(partialBlocks > 0 && partialBlocks < blocks.length, `rendered during yield: ${partialBlocks}`);
+  assert.equal(root.querySelectorAll("[data-reader-block-id]").length, 125);
+  assert.equal(root.querySelectorAll(".test-math").length, 125);
+  assert.equal(harness.calls.filter(call => call.startsWith("math:")).length, 125);
+  assert.equal(harness.calls.filter(call => call === "flush").length, 1);
+});
+
+test("cancelling a long render at its first yield stops later blocks and formulas", async () => {
+  let current = true;
+  const blocks = Array.from({ length: 125 }, (_, index) => block(`body-${index}`, "paragraph", `Formula $x_${index}=1$.`));
+  const { root, harness } = await render(blocks, undefined, { isCurrent: () => current }, () => {
+    setTimeout(() => { current = false; }, 0);
+  });
+  const rendered = root.querySelectorAll("[data-reader-block-id]").length;
+  assert.ok(rendered > 0 && rendered < blocks.length);
+  assert.equal(harness.calls.filter(call => call.startsWith("math:")).length, rendered);
+  assert.equal(harness.calls.includes("flush"), false);
+});
+
+function rectangle(top: number, height = 80, width = 500): DOMRect {
+  return { top, left: 0, right: width, bottom: top + height, width, height, x: 0, y: top, toJSON: () => ({}) } as DOMRect;
+}
+
+test("page tracker coalesces scroll frames and reuses cached geometry, then disposes listeners", async () => {
+  const { root } = await render(Array.from({ length: 100 }, (_, index) =>
+    block(`body-${index}`, "paragraph", "Body text.", { sources: [{ page: index + 1 }] })));
+  let measurements = 0;
+  root.scrollTop = 0;
+  root.getBoundingClientRect = () => { measurements++; return rectangle(0, 500); };
+  Array.from(root.querySelectorAll<HTMLElement>(".pdf-reader-block")).forEach((element, index) => {
+    element.getBoundingClientRect = () => { measurements++; return rectangle(index * 100 - root.scrollTop, 90); };
+  });
+  const win = root.ownerDocument.defaultView!;
+  const request = win.requestAnimationFrame;
+  const cancel = win.cancelAnimationFrame;
+  const frames = new Map<number, FrameRequestCallback>();
+  let nextFrame = 0;
+  win.requestAnimationFrame = callback => { frames.set(++nextFrame, callback); return nextFrame; };
+  win.cancelAnimationFrame = id => { frames.delete(id); };
+  const pages: number[] = [];
+  const tracker = (await renderer).createSourcePageTracker(root, page => pages.push(page));
+  try {
+    assert.equal(tracker.getPage(), 1);
+    const initialMeasurements = measurements;
+    for (let index = 0; index <= 100; index++) {
+      root.scrollTop = index * 20;
+      root.dispatchEvent(new win.Event("scroll"));
+    }
+    assert.equal(frames.size, 1);
+    assert.equal(tracker.getPage(), 21);
+    assert.equal((await renderer).getVisibleSourcePage(root), 21);
+    assert.equal(measurements, initialMeasurements);
+    const callback = frames.values().next().value!;
+    frames.clear(); callback(0);
+    assert.deepEqual(pages, [21]);
+    assert.equal(measurements, initialMeasurements);
+    root.dispatchEvent(new win.Event("scroll"));
+    tracker.dispose();
+    assert.equal(frames.size, 0);
+    root.dispatchEvent(new win.Event("scroll"));
+    assert.equal(frames.size, 0);
+    assert.equal(tracker.getPage(), undefined);
+  } finally { tracker.dispose(); win.requestAnimationFrame = request; win.cancelAnimationFrame = cancel; }
+});
+
+test("page tracker handles hidden roots, closed folds, toggling and resize", async () => {
+  const { root } = await render([
+    block("reference-1", "references", "First source."),
+    block("reference-2", "references", "Second source.", { sources: [{ page: 2 }] }),
+    block("body", "paragraph", "Following body.", { sources: [{ page: 3 }] }),
+  ]);
+  root.scrollTop = 125;
+  let height = 0;
+  let bodyTop = 100;
+  root.getBoundingClientRect = () => rectangle(0, height);
+  const fold = root.querySelector<HTMLDetailsElement>("details")!;
+  root.querySelector<HTMLElement>("summary")!.getBoundingClientRect = () => rectangle(-root.scrollTop, 30);
+  root.querySelector<HTMLElement>('[data-reader-block-id="reference-1"]')!.getBoundingClientRect = () => rectangle(40 - root.scrollTop, 90);
+  root.querySelector<HTMLElement>('[data-reader-block-id="reference-2"]')!.getBoundingClientRect = () => rectangle(140 - root.scrollTop, 100);
+  root.querySelector<HTMLElement>('[data-reader-block-id="body"]')!.getBoundingClientRect = () => rectangle(bodyTop - root.scrollTop, 100);
+  const tracker = (await renderer).createSourcePageTracker(root, () => {});
+  try {
+    assert.equal(tracker.getPage(), undefined);
+    height = 500;
+    assert.equal(tracker.getPage(), 3);
+    fold.setAttribute("open", ""); bodyTop = 500;
+    fold.dispatchEvent(new root.ownerDocument.defaultView!.Event("toggle", { bubbles: true }));
+    assert.equal(tracker.getPage(), 2);
+    root.scrollTop = 400;
+    root.ownerDocument.defaultView!.dispatchEvent(new root.ownerDocument.defaultView!.Event("resize"));
+    assert.equal(tracker.getPage(), 3);
+  } finally { tracker.dispose(); }
+});
+
+test("an unknown-size image load invalidates page offsets while reserved image loads do not", async () => {
+  const { root } = await render([
+    block("unknown", "figure", "", { asset: "unknown.png" }),
+    block("body", "paragraph", "Body on page two.", { sources: [{ page: 2 }] }),
+    block("reserved", "figure", "", { asset: "reserved.png", sources: [{ page: 2 }] }),
+  ], undefined, { assetUrl: reference => `app://local/${reference}`,
+    assetDimensions: reference => reference === "reserved.png" ? { width: 100, height: 50 } : undefined });
+  root.scrollTop = 0;
+  let measurements = 0;
+  let bodyTop = 120;
+  root.getBoundingClientRect = () => rectangle(0, 500);
+  const unknown = root.querySelector<HTMLElement>('[data-reader-block-id="unknown"]')!;
+  unknown.getBoundingClientRect = () => { measurements++; return rectangle(-root.scrollTop, bodyTop); };
+  root.querySelector<HTMLElement>('[data-reader-block-id="body"]')!.getBoundingClientRect = () => { measurements++; return rectangle(bodyTop - root.scrollTop, 100); };
+  const reserved = root.querySelector<HTMLElement>('[data-reader-block-id="reserved"]')!;
+  reserved.getBoundingClientRect = () => { measurements++; return rectangle(bodyTop + 120 - root.scrollTop, 60); };
+  const tracker = (await renderer).createSourcePageTracker(root, () => {});
+  try {
+    tracker.getPage();
+    const initial = measurements;
+    reserved.querySelector("img")!.dispatchEvent(new root.ownerDocument.defaultView!.Event("load", { bubbles: true }));
+    tracker.getPage();
+    assert.equal(measurements, initial);
+    const image = unknown.querySelector<HTMLImageElement>("img")!;
+    Object.defineProperties(image, { naturalWidth: { value: 100 }, naturalHeight: { value: 400 } });
+    bodyTop = 400;
+    image.dispatchEvent(new root.ownerDocument.defaultView!.Event("load", { bubbles: true }));
+    root.scrollTop = 150;
+    assert.equal(tracker.getPage(), 1);
+    assert.ok(measurements > initial);
+  } finally { tracker.dispose(); }
 });

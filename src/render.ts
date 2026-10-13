@@ -5,6 +5,8 @@ export interface ReaderRenderOptions {
   fontSize: number;
   lineHeight: number;
   assetUrl: (path: string) => string;
+  assetDimensions?: (path: string) => { width: number; height: number } | undefined;
+  isCurrent?: () => boolean;
   onSource: (page: number) => void;
   onCopy: (page: number) => void;
   onZoom: (url: string, caption: string) => void;
@@ -23,7 +25,11 @@ const OMIT_TAGS = new Set(["SCRIPT", "STYLE", "IFRAME", "OBJECT", "EMBED", "FORM
 
 /** Keep body/figure order, moving only ancillary blocks to the end of their section. */
 export async function renderReader(root: HTMLElement, readerDocument: ReaderDocument, options: ReaderRenderOptions): Promise<void> {
-  try { await loadMathJax(); } catch { /* Individual formulas retain their source-page fallback. */ }
+  if (options.isCurrent?.() === false) return;
+  if (readerDocument.blocks.some(requiresMath)) {
+    try { await loadMathJax(); } catch { /* Individual formulas retain their source-page fallback. */ }
+  }
+  if (options.isCurrent?.() === false) return;
   const context: RenderContext = {
     document: root.ownerDocument,
     options,
@@ -35,6 +41,15 @@ export async function renderReader(root: HTMLElement, readerDocument: ReaderDocu
   const article = context.document.createElement("article");
   article.className = "pdf-reader-article";
   article.setAttribute("aria-label", "PDF 阅读模式正文");
+  root.replaceChildren(article);
+
+  let rendered = 0;
+  let batchStarted = performance.now();
+  const shouldYield = () => ++rendered % 40 === 0 || performance.now() - batchStarted >= 12;
+  const yieldToUI = async () => {
+    await new Promise<void>(resolve => setTimeout(resolve, 0));
+    batchStarted = performance.now();
+  };
 
   const blocks = sectionEndAncillary(readerDocument.blocks);
   for (let index = 0; index < blocks.length;) {
@@ -44,6 +59,10 @@ export async function renderReader(root: HTMLElement, readerDocument: ReaderDocu
     if (!fold) {
       article.append(renderBlock(block, context));
       index += 1;
+      if (shouldYield()) {
+        await yieldToUI();
+        if (options.isCurrent?.() === false) return;
+      }
       continue;
     }
 
@@ -64,10 +83,16 @@ export async function renderReader(root: HTMLElement, readerDocument: ReaderDocu
     details.append(summary);
     const content = context.document.createElement("div");
     content.className = "pdf-reader-fold-content";
-    const foldedContext = { ...context, markedPages: new Set<number>() };
-    for (const item of group) content.append(renderBlock(item, foldedContext));
     details.append(content);
     article.append(details);
+    const foldedContext = { ...context, markedPages: new Set<number>() };
+    for (const item of group) {
+      content.append(renderBlock(item, foldedContext));
+      if (shouldYield()) {
+        await yieldToUI();
+        if (options.isCurrent?.() === false) return;
+      }
+    }
   }
 
   if (!readerDocument.blocks.length) {
@@ -76,19 +101,6 @@ export async function renderReader(root: HTMLElement, readerDocument: ReaderDocu
     empty.textContent = "没有可重排的正文，请查看原 PDF。";
     article.append(empty);
   }
-  root.replaceChildren(article);
-
-  // Establish image ratios before the caller restores a source-page position.
-  // Lazy images above that position would otherwise shift the reading page later.
-  const imageLayout = Promise.all(Array.from(article.querySelectorAll<HTMLImageElement>("img")).map(async (image) => {
-    image.loading = "eager";
-    try { await image.decode(); } catch { /* The image error handler provides the source-page fallback. */ }
-    if (image.naturalWidth > 0 && image.naturalHeight > 0) {
-      image.width = image.naturalWidth;
-      image.height = image.naturalHeight;
-      image.style.aspectRatio = `${image.naturalWidth} / ${image.naturalHeight}`;
-    }
-  }));
 
   if (context.mathDocuments.size) {
     try {
@@ -118,7 +130,12 @@ export async function renderReader(root: HTMLElement, readerDocument: ReaderDocu
       }
     }
   }
-  await imageLayout;
+}
+
+function requiresMath(block: ReaderBlock): boolean {
+  if (block.kind === "equation") return true;
+  return [block.text, block.html ?? "", ...(block.captions ?? []), ...(block.footnotes ?? [])]
+    .some(text => mathPattern().test(text) || /data-(?:math|latex)\s*=|math-(?:inline|display)/i.test(text));
 }
 
 export function scrollToSourcePage(root: HTMLElement, page: number): void {
@@ -138,23 +155,112 @@ export function scrollToSourcePage(root: HTMLElement, page: number): void {
   root.scrollTop = Math.max(0, top);
 }
 
+export interface SourcePageTracker {
+  getPage(): number | undefined;
+  dispose(): void;
+}
+
+interface PagePosition { page: number; top: number; bottom: number }
+interface PageIndex { positions: PagePosition[]; height: number }
+const pageTrackers = new WeakMap<HTMLElement, SourcePageTracker>();
+
+/** Cache geometry between layout changes; normal scrolling only reads scrollTop. */
+export function createSourcePageTracker(root: HTMLElement, onChange: (page: number) => void): SourcePageTracker {
+  pageTrackers.get(root)?.dispose();
+  const win = root.ownerDocument.defaultView!;
+  const requestFrame = (callback: FrameRequestCallback): number => win.requestAnimationFrame
+    ? win.requestAnimationFrame(callback) : win.setTimeout(() => callback(0), 16);
+  const cancelFrame = (id: number) => win.cancelAnimationFrame ? win.cancelAnimationFrame(id) : win.clearTimeout(id);
+  let index: PageIndex = { positions: [], height: 0 };
+  let dirty = true;
+  let frame: number | undefined;
+  let disposed = false;
+  let previousPage: number | undefined;
+  const getPage = (): number | undefined => {
+    if (disposed) return undefined;
+    if (dirty) { index = buildPageIndex(root); dirty = index.height <= 0; }
+    return pageAtScroll(index, root.scrollTop);
+  };
+  const schedule = () => {
+    if (disposed || frame !== undefined) return;
+    frame = requestFrame(() => {
+      frame = undefined;
+      const page = getPage();
+      if (page !== undefined && page !== previousPage) { previousPage = page; onChange(page); }
+    });
+  };
+  const invalidate = () => { dirty = true; schedule(); };
+  const imageLoad = (event: Event) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.tagName === "IMG" && target.dataset.readerLayoutReserved !== "true") invalidate();
+  };
+  const resize = win.ResizeObserver ? new win.ResizeObserver(invalidate) : undefined;
+  resize?.observe(root);
+  const article = root.querySelector("article");
+  if (article) resize?.observe(article);
+  root.addEventListener("scroll", schedule, { passive: true });
+  root.addEventListener("toggle", invalidate, true);
+  root.addEventListener("load", imageLoad, true);
+  root.addEventListener("error", invalidate, true);
+  win.addEventListener("resize", invalidate);
+  const tracker: SourcePageTracker = {
+    getPage,
+    dispose() {
+      if (disposed) return;
+      disposed = true;
+      if (frame !== undefined) cancelFrame(frame);
+      resize?.disconnect();
+      root.removeEventListener("scroll", schedule);
+      root.removeEventListener("toggle", invalidate, true);
+      root.removeEventListener("load", imageLoad, true);
+      root.removeEventListener("error", invalidate, true);
+      win.removeEventListener("resize", invalidate);
+      if (pageTrackers.get(root) === tracker) pageTrackers.delete(root);
+    },
+  };
+  pageTrackers.set(root, tracker);
+  return tracker;
+}
+
 export function getVisibleSourcePage(root: HTMLElement): number | undefined {
+  const tracker = pageTrackers.get(root);
+  return tracker ? tracker.getPage() : pageAtScroll(buildPageIndex(root), root.scrollTop);
+}
+
+function buildPageIndex(root: HTMLElement): PageIndex {
   const boundary = root.getBoundingClientRect();
-  const readingLine = boundary.top + Math.min(48, boundary.height / 4);
+  const positions: PagePosition[] = [];
   const elements = Array.from(root.querySelectorAll<HTMLElement>(".pdf-reader-block[data-source-pages], .pdf-reader-fold-summary[data-source-pages]"));
-  let nearest: { page: number; distance: number } | undefined;
   for (const element of elements) {
     const closedFold = element.closest("details:not([open])");
     if (closedFold && element.parentElement !== closedFold) continue;
     const rectangle = element.getBoundingClientRect();
-    if (rectangle.height <= 0 || rectangle.width <= 0 || rectangle.bottom <= boundary.top || rectangle.top >= boundary.bottom) continue;
+    if (rectangle.height <= 0 || rectangle.width <= 0) continue;
     const page = pagesFromElement(element)[0];
     if (!page) continue;
-    if (rectangle.top <= readingLine && rectangle.bottom > readingLine) return page;
-    const distance = Math.abs(rectangle.top - readingLine);
-    if (!nearest || distance < nearest.distance) nearest = { page, distance };
+    positions.push({ page, top: rectangle.top - boundary.top + root.scrollTop, bottom: rectangle.bottom - boundary.top + root.scrollTop });
   }
-  return nearest?.page;
+  positions.sort((left, right) => left.top - right.top);
+  return { positions, height: boundary.height };
+}
+
+function pageAtScroll(index: PageIndex, scrollTop: number): number | undefined {
+  if (index.height <= 0 || !index.positions.length) return undefined;
+  const line = scrollTop + Math.min(48, index.height / 4);
+  let low = 0;
+  let high = index.positions.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (index.positions[middle]!.top <= line) low = middle + 1;
+    else high = middle;
+  }
+  const before = index.positions[low - 1];
+  const after = index.positions[low];
+  if (before && before.bottom > line) return before.page;
+  const beforeVisible = before && before.bottom > scrollTop;
+  const afterVisible = after && after.top < scrollTop + index.height;
+  if (beforeVisible && (!afterVisible || line - before.top <= after.top - line)) return before.page;
+  return afterVisible ? after.page : undefined;
 }
 
 function renderBlock(block: ReaderBlock, context: RenderContext): HTMLElement {
@@ -191,7 +297,7 @@ function renderBlock(block: ReaderBlock, context: RenderContext): HTMLElement {
     const original = !rendered && block.asset ? resolveAsset(block.asset, context.options) : undefined;
     if (original) {
       equation.replaceChildren();
-      appendImage(equation, original, block.text || "原文公式", context);
+      appendImage(equation, original, block.text || "原文公式", context, undefined, block.asset);
     }
     wrapper.append(equation);
   } else if (block.kind === "list") {
@@ -227,7 +333,7 @@ function appendImageOrText(parent: HTMLElement, block: ReaderBlock, context: Ren
   const url = block.asset ? resolveAsset(block.asset, context.options) : undefined;
   if (url) {
     const caption = displayCaptions(block).join("\n");
-    appendImage(parent, url, caption, context, block.text || caption);
+    appendImage(parent, url, caption, context, block.text || caption, block.asset);
     return;
   }
   const fallback = context.document.createElement("p");
@@ -236,9 +342,8 @@ function appendImageOrText(parent: HTMLElement, block: ReaderBlock, context: Ren
   parent.append(fallback);
 }
 
-function appendImage(parent: HTMLElement, url: string, caption: string, context: RenderContext, altText?: string): void {
+function appendImage(parent: HTMLElement, url: string, caption: string, context: RenderContext, altText?: string, assetReference?: string): void {
   const image = context.document.createElement("img");
-  image.src = url;
   image.alt = (altText ?? caption).trim().slice(0, 300) || "文献图表";
   image.loading = "lazy";
   image.decoding = "async";
@@ -246,6 +351,18 @@ function appendImage(parent: HTMLElement, url: string, caption: string, context:
   image.tabIndex = 0;
   image.setAttribute("role", "button");
   image.setAttribute("aria-label", "放大查看图表");
+  const setDimensions = (width: number, height: number): boolean => {
+    if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return false;
+    image.setAttribute("width", String(width));
+    image.setAttribute("height", String(height));
+    image.style.aspectRatio = `${width} / ${height}`;
+    return true;
+  };
+  const dimensions = assetReference ? context.options.assetDimensions?.(assetReference) : undefined;
+  if (dimensions && setDimensions(dimensions.width, dimensions.height)) image.dataset.readerLayoutReserved = "true";
+  image.addEventListener("load", () => {
+    if (!image.hasAttribute("width") || !image.hasAttribute("height")) setDimensions(image.naturalWidth, image.naturalHeight);
+  }, { once: true });
   image.addEventListener("click", () => context.options.onZoom(url, caption));
   image.addEventListener("keydown", (event) => {
     if (event.key === "Enter" || event.key === " ") {
@@ -260,6 +377,7 @@ function appendImage(parent: HTMLElement, url: string, caption: string, context:
     warning.textContent = "图表无法加载，请查看源页。";
     image.after(warning);
   }, { once: true });
+  image.src = url;
   parent.append(image);
 }
 
@@ -375,7 +493,7 @@ function appendSafeNode(parent: HTMLElement, node: Node, context: RenderContext,
   if (tag === "IMG") {
     if (table) {
       const url = resolveAsset(element.getAttribute("src") ?? "", context.options);
-      if (url) appendImage(parent, url, element.getAttribute("alt") ?? "", context);
+      if (url) appendImage(parent, url, element.getAttribute("alt") ?? "", context, undefined, element.getAttribute("src") ?? undefined);
     }
     return;
   }

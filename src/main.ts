@@ -2,7 +2,8 @@ import { App, FileSystemAdapter, FileView, Modal, Notice, Plugin, PluginSettingT
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { ReaderService, resolveAssetReference, PDF_RESOURCE_OPTIONS, type CachedReader } from './service';
-import { renderReader, scrollToSourcePage, getVisibleSourcePage } from './render';
+import { renderReader, scrollToSourcePage, getVisibleSourcePage, createSourcePageTracker } from './render';
+import { readImageDimensions } from './image-size';
 
 const SECRET_ID = 'pdf-reading-mode-mineru-api-token';
 interface ReaderSettings { fontSize: number; lineHeight: number; positions: Record<string, number> }
@@ -14,6 +15,7 @@ interface LeafState {
   nativeElements: NativeElement[]; cached?: CachedReader;
   originalEphemeral: View['setEphemeralState']; wrappedEphemeral: View['setEphemeralState'];
   saveTimer?: number;
+  pageTracker?: ReturnType<typeof createSourcePageTracker>;
 }
 
 export default class PdfReadingModePlugin extends Plugin {
@@ -198,6 +200,8 @@ export default class PdfReadingModePlugin extends Plugin {
     search.addEventListener('input', () => { searchIndex = 0; find(); }); search.addEventListener('keydown', event => { if (event.key === 'Enter') { searchIndex++; find(); } });
     await renderReader(root, state.cached.document, { fontSize: this.settings.fontSize, lineHeight: this.settings.lineHeight,
       assetUrl: reference => this.assetUrl(state.cached!, reference),
+      assetDimensions: reference => state.cached!.assetDimensions?.[reference],
+      isCurrent: () => this.isCurrent(state, generation),
       onSource: sourcePage => this.showOriginal(state, sourcePage), onCopy: sourcePage => void this.copySource(state, sourcePage),
       onZoom: (url, caption) => new FigureModal(this.app, url, caption).open() });
     if (!this.isCurrent(state, generation)) { shell.remove(); return; }
@@ -209,12 +213,11 @@ export default class PdfReadingModePlugin extends Plugin {
     for (const { element } of state.nativeElements) { element.style.visibility = 'hidden'; element.inert = true; element.setAttribute('aria-hidden', 'true'); }
     state.content.classList.add('pdf-reading-mode-active'); root.dataset.pdfReaderActive = 'true';
     this.emitMode(state); this.navigateReader(state, state.page);
-    root.addEventListener('scroll', () => {
-      const current = getVisibleSourcePage(root); if (!current) return;
+    state.pageTracker = createSourcePageTracker(root, current => {
       state.page = current; page.value = String(current); state.pageLabel!.textContent = `PDF p.${current} / ${state.cached!.document.pageCount}`;
       const win = state.document.defaultView!; win.clearTimeout(state.saveTimer);
       state.saveTimer = win.setTimeout(() => { this.settings.positions[state.file.path] = state.page; void this.saveSettings(); }, 800);
-    }, { passive: true });
+    });
   }
 
   private navigateReader(state: LeafState, page: number): void {
@@ -226,7 +229,10 @@ export default class PdfReadingModePlugin extends Plugin {
 
   private exit(state: LeafState, synchronize = true): void {
     const wasActive = state.root?.dataset.pdfReaderActive === 'true';
-    const page = state.root ? getVisibleSourcePage(state.root) || state.page : state.page;
+    const page = state.pageTracker?.getPage() ?? (state.root ? getVisibleSourcePage(state.root) || state.page : state.page);
+    state.pageTracker?.dispose(); state.pageTracker = undefined;
+    state.document.defaultView?.clearTimeout(state.saveTimer);
+    if (wasActive) { this.settings.positions[state.file.path] = page; void this.saveSettings(); }
     state.desired = false; state.generation++; state.waiting?.remove(); state.waiting = undefined;
     if (state.root) state.root.dataset.pdfReaderActive = 'false';
     this.emitMode(state);
@@ -265,57 +271,100 @@ export default class PdfReadingModePlugin extends Plugin {
   private async makeFallbackAssets(state: LeafState, cached: CachedReader): Promise<CachedReader> {
     const existing = this.assetJobs.get(cached.directory);
     if (existing) return await existing;
-    const job = this.cropFallbackAssets(state, cached).then(() => cached);
+    const job = (async () => {
+      const changed = await this.cropFallbackAssets(state, cached);
+      const measured = await this.prepareAssetDimensions(cached);
+      if (changed || measured) {
+        await fs.writeFile(path.join(cached.directory, 'result.json.tmp'), JSON.stringify(cached));
+        await fs.rename(path.join(cached.directory, 'result.json.tmp'), path.join(cached.directory, 'result.json'));
+      }
+      return cached;
+    })();
     this.assetJobs.set(cached.directory, job);
     try { return await job; }
     finally { if (this.assetJobs.get(cached.directory) === job) this.assetJobs.delete(cached.directory); }
   }
 
-  private async cropFallbackAssets(state: LeafState, cached: CachedReader): Promise<void> {
+  private async prepareAssetDimensions(cached: CachedReader): Promise<boolean> {
+    const dimensions = cached.assetDimensions ??= {};
+    const assets = Array.from(new Set(cached.document.blocks.map(block => block.asset).filter((asset): asset is string => Boolean(asset))));
+    let changed = false;
+    // Bound file reads; only the encoded header is needed to reserve layout space.
+    for (let index = 0; index < assets.length; index += 8) {
+      await Promise.all(assets.slice(index, index + 8).map(async asset => {
+        if (dimensions[asset]) return;
+        const resolved = resolveAssetReference(asset, cached.contentBase, cached.assets);
+        if (!resolved) return;
+        try {
+          const measured = await readImageDimensions(path.join(cached.directory, resolved));
+          if (measured) { dimensions[asset] = measured; changed = true; }
+        } catch { /* The renderer provides a source-page fallback for unavailable images. */ }
+      }));
+    }
+    return changed;
+  }
+
+  private async cropFallbackAssets(state: LeafState, cached: CachedReader): Promise<boolean> {
     const missing = cached.document.blocks.filter(block => block.sources[0]?.bbox && (
       block.kind === 'table' ? block.asset !== 'source-tables-v1/' + block.id + '.png' :
       ['figure', 'equation'].includes(block.kind) && !block.asset
     ));
-    if (!missing.length) return;
+    if (!missing.length) return false;
+    const pending: typeof missing = [];
+    for (const block of missing) {
+      const asset = (block.kind === 'table' ? 'source-tables-v1/' : 'fallback-v2/') + block.id + '.png';
+      try {
+        await fs.access(path.join(cached.directory, asset)); block.asset = asset;
+        if (!cached.assets.includes(asset)) cached.assets.push(asset);
+      } catch { pending.push(block); }
+    }
+    // Existing source crops do not require opening the original PDF again.
+    if (!pending.length) return true;
+    const pages = new Map<number, typeof pending>();
+    for (const block of pending) {
+      const page = block.sources[0]!.page;
+      const group = pages.get(page) ?? []; group.push(block); pages.set(page, group);
+    }
     const pdfjs = await loadPdfJs(); const binary = await this.app.vault.readBinary(state.file);
     const pdf = await pdfjs.getDocument({ ...PDF_RESOURCE_OPTIONS, data: new Uint8Array(binary), useSystemFonts: true }).promise;
     try {
-      for (const block of missing) {
-        const asset = (block.kind === 'table' ? 'source-tables-v1/' : 'fallback-v2/') + block.id + '.png';
-        try {
-          await fs.access(path.join(cached.directory, asset)); block.asset = asset;
-          if (!cached.assets.includes(asset)) cached.assets.push(asset);
-          continue;
-        } catch { /* Crop this source region once, then retain it in the offline cache. */ }
-        const source = block.sources[0]!; const page = await pdf.getPage(source.page);
+      for (const [pageNumber, blocks] of pages) {
+        const page = await pdf.getPage(pageNumber);
         const viewport = page.getViewport({ scale: 2 * Math.min(state.document.defaultView?.devicePixelRatio ?? 1, 2) });
         const full = state.document.createElement('canvas'); full.width = Math.ceil(viewport.width); full.height = Math.ceil(viewport.height);
-        await page.render({ canvas: full, canvasContext: full.getContext('2d'), viewport, intent: 'print' }).promise;
-        const box = source.bbox!;
-        const padding = block.kind === 'table' ? 2 : 10;
-        const padX = padding * viewport.scale / full.width, padY = padding * viewport.scale / full.height;
-        // Provider boxes can end just above a table's bottom rule. Keep the
-        // rule while leaving the preceding title outside the selectable crop.
-        const bottomPadY = (block.kind === 'table' ? 4 : 10) * viewport.scale / full.height;
-        const [x0, y0, x1, y1] = [Math.max(0, box[0] - padX), Math.max(0, box[1] - (block.kind === 'table' ? 0 : padY)), Math.min(1, box[2] + padX), Math.min(1, box[3] + bottomPadY)];
-        const crop = state.document.createElement('canvas');
-        crop.width = Math.max(1, Math.ceil((x1 - x0) * full.width)); crop.height = Math.max(1, Math.ceil((y1 - y0) * full.height));
-        const context = crop.getContext('2d')!;
-        context.drawImage(full, x0 * full.width, y0 * full.height, crop.width, crop.height, 0, 0, crop.width, crop.height);
-        // Grouped figures retain separate caption rectangles after the union source.
-        // The caption is selectable reflow text below the image, rather than a second tiny raster copy.
-        if (block.kind === 'figure') for (const caption of block.sources.slice(1)) {
-          if (caption.page !== source.page || !caption.bbox) continue;
-          const [cx0, cy0, cx1, cy1] = caption.bbox;
-          context.fillStyle = '#fff';
-          context.fillRect((cx0 - x0) * full.width - 1, (cy0 - y0) * full.height - 1, (cx1 - cx0) * full.width + 2, (cy1 - cy0) * full.height + 2);
-        }
-        await fs.mkdir(path.dirname(path.join(cached.directory, asset)), { recursive: true });
-        await fs.writeFile(path.join(cached.directory, asset), Buffer.from(crop.toDataURL('image/png').split(',')[1]!, 'base64'));
-        block.asset = asset; cached.assets.push(asset); full.width = 0; full.height = 0;
+        try {
+          await page.render({ canvas: full, canvasContext: full.getContext('2d'), viewport, intent: 'print' }).promise;
+          for (const block of blocks) {
+            const source = block.sources[0]!;
+            const asset = (block.kind === 'table' ? 'source-tables-v1/' : 'fallback-v2/') + block.id + '.png';
+            const box = source.bbox!;
+            const padding = block.kind === 'table' ? 2 : 10;
+            const padX = padding * viewport.scale / full.width, padY = padding * viewport.scale / full.height;
+            const bottomPadY = (block.kind === 'table' ? 4 : 10) * viewport.scale / full.height;
+            const [x0, y0, x1, y1] = [Math.max(0, box[0] - padX), Math.max(0, box[1] - (block.kind === 'table' ? 0 : padY)), Math.min(1, box[2] + padX), Math.min(1, box[3] + bottomPadY)];
+            const crop = state.document.createElement('canvas');
+            crop.width = Math.max(1, Math.ceil((x1 - x0) * full.width)); crop.height = Math.max(1, Math.ceil((y1 - y0) * full.height));
+            try {
+              const context = crop.getContext('2d')!;
+              context.drawImage(full, x0 * full.width, y0 * full.height, crop.width, crop.height, 0, 0, crop.width, crop.height);
+              // Preserve selectable captions, with the same original-PDF crop boundaries.
+              if (block.kind === 'figure') for (const caption of block.sources.slice(1)) {
+                if (caption.page !== source.page || !caption.bbox) continue;
+                const [cx0, cy0, cx1, cy1] = caption.bbox;
+                context.fillStyle = '#fff';
+                context.fillRect((cx0 - x0) * full.width - 1, (cy0 - y0) * full.height - 1, (cx1 - cx0) * full.width + 2, (cy1 - cy0) * full.height + 2);
+              }
+              await fs.mkdir(path.dirname(path.join(cached.directory, asset)), { recursive: true });
+              await fs.writeFile(path.join(cached.directory, asset), await encodeCanvas(crop));
+              (cached.assetDimensions ??= {})[asset] = { width: crop.width, height: crop.height };
+              block.asset = asset; if (!cached.assets.includes(asset)) cached.assets.push(asset);
+            } finally { crop.width = 0; crop.height = 0; }
+          }
+        } finally { full.width = 0; full.height = 0; page.cleanup(); }
+        // Give the UI a turn between source pages rather than occupying a long task.
+        await new Promise<void>(resolve => state.document.defaultView!.setTimeout(resolve, 0));
       }
-      await fs.writeFile(path.join(cached.directory, 'result.json.tmp'), JSON.stringify(cached));
-      await fs.rename(path.join(cached.directory, 'result.json.tmp'), path.join(cached.directory, 'result.json'));
+      return true;
     } finally { await pdf.destroy(); }
   }
 
@@ -358,4 +407,11 @@ function currentNativePage(state: LeafState): number | undefined {
   }
   const current = state.content.querySelector<HTMLInputElement>('.page-number input, input.page-number, input[type="number"]');
   return page || Number(current?.value) || undefined;
+}
+
+async function encodeCanvas(canvas: HTMLCanvasElement): Promise<Buffer> {
+  const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => {
+    if (value) resolve(value); else reject(new Error('原文图表生成失败，请重试。'));
+  }, 'image/png'));
+  return Buffer.from(await blob.arrayBuffer());
 }
