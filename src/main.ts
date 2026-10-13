@@ -4,6 +4,8 @@ import { promises as fs } from 'node:fs';
 import { ReaderService, resolveAssetReference, PDF_RESOURCE_OPTIONS, type CachedReader } from './service';
 import { renderReader, scrollToSourcePage, getVisibleSourcePage, createSourcePageTracker } from './render';
 import { readImageDimensions } from './image-size';
+import { observeScrollPerformance } from './scroll-performance';
+import { prepareNearbyImages } from './image-decode';
 
 const SECRET_ID = 'pdf-reading-mode-mineru-api-token';
 interface ReaderSettings { fontSize: number; lineHeight: number; positions: Record<string, number> }
@@ -16,6 +18,8 @@ interface LeafState {
   originalEphemeral: View['setEphemeralState']; wrappedEphemeral: View['setEphemeralState'];
   saveTimer?: number;
   pageTracker?: ReturnType<typeof createSourcePageTracker>;
+  stopScrollProfile?: () => void;
+  stopImageDecoding?: () => void;
 }
 
 export default class PdfReadingModePlugin extends Plugin {
@@ -213,10 +217,19 @@ export default class PdfReadingModePlugin extends Plugin {
     for (const { element } of state.nativeElements) { element.style.visibility = 'hidden'; element.inert = true; element.setAttribute('aria-hidden', 'true'); }
     state.content.classList.add('pdf-reading-mode-active'); root.dataset.pdfReaderActive = 'true';
     this.emitMode(state); this.navigateReader(state, state.page);
+    state.stopImageDecoding = prepareNearbyImages(root);
     state.pageTracker = createSourcePageTracker(root, current => {
       state.page = current; page.value = String(current); state.pageLabel!.textContent = `PDF p.${current} / ${state.cached!.document.pageCount}`;
       const win = state.document.defaultView!; win.clearTimeout(state.saveTimer);
       state.saveTimer = win.setTimeout(() => { this.settings.positions[state.file.path] = state.page; void this.saveSettings(); }, 800);
+    });
+    const scrollReports: object[] = [];
+    state.stopScrollProfile = observeScrollPerformance(root, report => {
+      if (!this.isCurrent(state, generation)) return;
+      scrollReports.push({ ...report, pageIndex: state.pageTracker?.getStats() });
+      if (scrollReports.length > 12) scrollReports.shift();
+      const profile = { version: this.manifest.version, reports: scrollReports };
+      void fs.writeFile(path.join(state.cached!.directory, 'performance.json'), JSON.stringify(profile, null, 2)).catch(() => {});
     });
   }
 
@@ -231,6 +244,8 @@ export default class PdfReadingModePlugin extends Plugin {
     const wasActive = state.root?.dataset.pdfReaderActive === 'true';
     const page = state.pageTracker?.getPage() ?? (state.root ? getVisibleSourcePage(state.root) || state.page : state.page);
     state.pageTracker?.dispose(); state.pageTracker = undefined;
+    state.stopScrollProfile?.(); state.stopScrollProfile = undefined;
+    state.stopImageDecoding?.(); state.stopImageDecoding = undefined;
     state.document.defaultView?.clearTimeout(state.saveTimer);
     if (wasActive) { this.settings.positions[state.file.path] = page; void this.saveSettings(); }
     state.desired = false; state.generation++; state.waiting?.remove(); state.waiting = undefined;

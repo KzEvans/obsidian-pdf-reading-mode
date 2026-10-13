@@ -157,6 +157,7 @@ export function scrollToSourcePage(root: HTMLElement, page: number): void {
 
 export interface SourcePageTracker {
   getPage(): number | undefined;
+  getStats(): { rebuilds: number; rebuildMs: number; invalidations: Record<string, number> };
   dispose(): void;
 }
 
@@ -176,9 +177,18 @@ export function createSourcePageTracker(root: HTMLElement, onChange: (page: numb
   let frame: number | undefined;
   let disposed = false;
   let previousPage: number | undefined;
+  let rebuilds = 0;
+  let rebuildMs = 0;
+  const invalidations: Record<string, number> = {};
   const getPage = (): number | undefined => {
     if (disposed) return undefined;
-    if (dirty) { index = buildPageIndex(root); dirty = index.height <= 0; }
+    if (dirty) {
+      const started = performance.now();
+      index = buildPageIndex(root);
+      rebuilds++;
+      rebuildMs += performance.now() - started;
+      dirty = index.height <= 0;
+    }
     return pageAtScroll(index, root.scrollTop);
   };
   const schedule = () => {
@@ -189,32 +199,41 @@ export function createSourcePageTracker(root: HTMLElement, onChange: (page: numb
       if (page !== undefined && page !== previousPage) { previousPage = page; onChange(page); }
     });
   };
-  const invalidate = () => { dirty = true; schedule(); };
+  const invalidate = (reason: string) => {
+    if (disposed) return;
+    invalidations[reason] = (invalidations[reason] ?? 0) + 1;
+    dirty = true;
+    schedule();
+  };
+  const toggle = () => invalidate("toggle");
+  const error = () => invalidate("error");
+  const windowResize = () => invalidate("window-resize");
   const imageLoad = (event: Event) => {
     const target = event.target as HTMLElement | null;
-    if (target?.tagName === "IMG" && target.dataset.readerLayoutReserved !== "true") invalidate();
+    if (target?.tagName === "IMG" && target.dataset.readerLayoutReserved !== "true") invalidate("load");
   };
-  const resize = win.ResizeObserver ? new win.ResizeObserver(invalidate) : undefined;
+  const resize = win.ResizeObserver ? new win.ResizeObserver(() => invalidate("resize-observer")) : undefined;
   resize?.observe(root);
   const article = root.querySelector("article");
   if (article) resize?.observe(article);
   root.addEventListener("scroll", schedule, { passive: true });
-  root.addEventListener("toggle", invalidate, true);
+  root.addEventListener("toggle", toggle, true);
   root.addEventListener("load", imageLoad, true);
-  root.addEventListener("error", invalidate, true);
-  win.addEventListener("resize", invalidate);
+  root.addEventListener("error", error, true);
+  win.addEventListener("resize", windowResize);
   const tracker: SourcePageTracker = {
     getPage,
+    getStats: () => ({ rebuilds, rebuildMs, invalidations: { ...invalidations } }),
     dispose() {
       if (disposed) return;
       disposed = true;
       if (frame !== undefined) cancelFrame(frame);
       resize?.disconnect();
       root.removeEventListener("scroll", schedule);
-      root.removeEventListener("toggle", invalidate, true);
+      root.removeEventListener("toggle", toggle, true);
       root.removeEventListener("load", imageLoad, true);
-      root.removeEventListener("error", invalidate, true);
-      win.removeEventListener("resize", invalidate);
+      root.removeEventListener("error", error, true);
+      win.removeEventListener("resize", windowResize);
       if (pageTrackers.get(root) === tracker) pageTrackers.delete(root);
     },
   };

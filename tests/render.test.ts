@@ -414,3 +414,63 @@ test("an unknown-size image load invalidates page offsets while reserved image l
     assert.ok(measurements > initial);
   } finally { tracker.dispose(); }
 });
+
+test("page tracker reports rebuild attempts and isolated invalidation counters without counting scrolls", async () => {
+  const { root } = await render([block("body", "paragraph", "Body text.")]);
+  const win = root.ownerDocument.defaultView!;
+  const originalObserver = win.ResizeObserver;
+  const originalRequest = win.requestAnimationFrame;
+  const originalCancel = win.cancelAnimationFrame;
+  let observerCallback: ResizeObserverCallback | undefined;
+  win.ResizeObserver = class {
+    constructor(callback: ResizeObserverCallback) { observerCallback = callback; }
+    observe() {}
+    disconnect() {}
+  } as unknown as typeof ResizeObserver;
+  win.requestAnimationFrame = () => 1;
+  win.cancelAnimationFrame = () => {};
+  let height = 0;
+  root.scrollTop = 0;
+  root.getBoundingClientRect = () => rectangle(0, height);
+  root.querySelector<HTMLElement>(".pdf-reader-block")!.getBoundingClientRect = () => rectangle(-root.scrollTop, 100);
+  const image = root.ownerDocument.createElement("img");
+  const reserved = root.ownerDocument.createElement("img");
+  reserved.dataset.readerLayoutReserved = "true";
+  root.append(image, reserved);
+  const tracker = (await renderer).createSourcePageTracker(root, () => {});
+  try {
+    assert.equal(tracker.getPage(), undefined);
+    assert.equal(tracker.getPage(), undefined);
+    assert.equal(tracker.getStats().rebuilds, 2);
+    height = 500;
+    assert.equal(tracker.getPage(), 1);
+    for (let index = 0; index < 20; index++) {
+      root.dispatchEvent(new win.Event("scroll"));
+      tracker.getPage();
+    }
+    assert.deepEqual(tracker.getStats().invalidations, {});
+    assert.equal(tracker.getStats().rebuilds, 3);
+    reserved.dispatchEvent(new win.Event("load", { bubbles: true }));
+    tracker.getPage();
+    assert.equal(tracker.getStats().rebuilds, 3);
+    image.dispatchEvent(new win.Event("load", { bubbles: true }));
+    root.dispatchEvent(new win.Event("error"));
+    root.dispatchEvent(new win.Event("toggle"));
+    win.dispatchEvent(new win.Event("resize"));
+    observerCallback!([], {} as ResizeObserver);
+    tracker.getPage();
+    const stats = tracker.getStats();
+    assert.equal(stats.rebuilds, 4);
+    assert.ok(Number.isFinite(stats.rebuildMs) && stats.rebuildMs >= 0);
+    assert.deepEqual(stats.invalidations, { load: 1, error: 1, toggle: 1, "window-resize": 1, "resize-observer": 1 });
+    stats.rebuilds = 999;
+    stats.invalidations.load = 999;
+    assert.equal(tracker.getStats().rebuilds, 4);
+    assert.equal(tracker.getStats().invalidations.load, 1);
+  } finally {
+    tracker.dispose();
+    win.ResizeObserver = originalObserver;
+    win.requestAnimationFrame = originalRequest;
+    win.cancelAnimationFrame = originalCancel;
+  }
+});
