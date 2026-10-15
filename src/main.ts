@@ -2,13 +2,13 @@ import { App, FileSystemAdapter, FileView, Modal, Notice, Plugin, PluginSettingT
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
 import { ReaderService, resolveAssetReference, PDF_RESOURCE_OPTIONS, type CachedReader } from './service';
-import { renderReader, scrollToSourcePage, getVisibleSourcePage, createSourcePageTracker } from './render';
+import { renderReader, scrollToSourcePage, getVisibleSourcePage, createSourcePageTracker, blockSearchText } from './render';
 import { readImageDimensions } from './image-size';
 import { observeScrollPerformance } from './scroll-performance';
 import { prepareNearbyImages } from './image-decode';
 
 const SECRET_ID = 'pdf-reading-mode-mineru-api-token';
-interface ReaderSettings { fontSize: number; lineHeight: number; positions: Record<string, number> }
+interface ReaderSettings { fontSize: number; lineHeight: number; scrollDiagnostics: boolean; positions: Record<string, number> }
 interface NativeElement { element: HTMLElement; visibility: string; inert: boolean; ariaHidden: string | null }
 interface LeafState {
   leaf: WorkspaceLeaf; view: View; file: TFile; filePath: string; revision: number; button: HTMLButtonElement;
@@ -23,7 +23,7 @@ interface LeafState {
 }
 
 export default class PdfReadingModePlugin extends Plugin {
-  settings: ReaderSettings = { fontSize: 18, lineHeight: 1.5, positions: {} };
+  settings: ReaderSettings = { fontSize: 18, lineHeight: 1.5, scrollDiagnostics: false, positions: {} };
   private states = new Map<WorkspaceLeaf, LeafState>();
   private service!: ReaderService;
   private assetJobs = new Map<string, Promise<CachedReader>>();
@@ -32,7 +32,7 @@ export default class PdfReadingModePlugin extends Plugin {
 
   async onload(): Promise<void> {
     const saved = await this.loadData() as Partial<ReaderSettings> | null;
-    this.settings = { fontSize: clamp(saved?.fontSize ?? 18, 16, 24), lineHeight: clamp(saved?.lineHeight ?? 1.5, 1.3, 1.8), positions: saved?.positions ?? {} };
+    this.settings = { fontSize: clamp(saved?.fontSize ?? 18, 16, 24), lineHeight: clamp(saved?.lineHeight ?? 1.5, 1.3, 1.8), scrollDiagnostics: saved?.scrollDiagnostics === true, positions: saved?.positions ?? {} };
     if (!(this.app.vault.adapter instanceof FileSystemAdapter)) throw new Error('PDF Reading Mode 需要桌面版文件系统。');
     const directory = path.join(this.app.vault.adapter.getBasePath(), this.manifest.dir ?? this.app.vault.configDir + '/plugins/pdf-reading-mode');
     this.service = new ReaderService(this.app, directory, () => this.app.secretStorage.getSecret(SECRET_ID)?.trim() || null);
@@ -53,7 +53,16 @@ export default class PdfReadingModePlugin extends Plugin {
         if (reopen) void this.toggle(state);
       }
     }));
-    this.registerEvent(this.app.vault.on('rename', () => this.queueRefresh()));
+    this.registerEvent(this.app.vault.on('rename', (file, oldPath) => {
+      // Keep the reader open and its saved position when the open PDF is renamed or moved.
+      if (file instanceof TFile && oldPath in this.settings.positions) {
+        this.settings.positions[file.path] = this.settings.positions[oldPath]!;
+        delete this.settings.positions[oldPath];
+        void this.saveSettings();
+      }
+      for (const state of this.states.values()) if (state.file === file) state.filePath = file.path;
+      this.queueRefresh();
+    }));
     this.app.workspace.onLayoutReady(() => this.refresh());
   }
 
@@ -197,7 +206,7 @@ export default class PdfReadingModePlugin extends Plugin {
     const find = () => {
       root.querySelectorAll('.pdf-reader-search-hit').forEach(element => element.classList.remove('pdf-reader-search-hit'));
       const term = search.value.trim().toLowerCase(); if (!term) return;
-      const matches = Array.from(root.querySelectorAll<HTMLElement>('[data-reader-block-id]')).filter(element => element.textContent?.toLowerCase().includes(term));
+      const matches = Array.from(root.querySelectorAll<HTMLElement>('[data-reader-block-id]')).filter(element => blockSearchText(element).toLowerCase().includes(term));
       const match = matches[searchIndex % matches.length]; if (!match) return;
       match.closest('details')?.setAttribute('open', ''); match.classList.add('pdf-reader-search-hit'); match.scrollIntoView({ block: 'center' });
     };
@@ -223,6 +232,7 @@ export default class PdfReadingModePlugin extends Plugin {
       const win = state.document.defaultView!; win.clearTimeout(state.saveTimer);
       state.saveTimer = win.setTimeout(() => { this.settings.positions[state.file.path] = state.page; void this.saveSettings(); }, 800);
     });
+    if (!this.settings.scrollDiagnostics) return;
     const scrollReports: object[] = [];
     state.stopScrollProfile = observeScrollPerformance(root, report => {
       if (!this.isCurrent(state, generation)) return;
@@ -274,7 +284,9 @@ export default class PdfReadingModePlugin extends Plugin {
     this.exit(state, false); state.content.getBoundingClientRect(); state.originalEphemeral.call(state.view, { subpath: '#page=' + page, focus: true });
   }
   private async copySource(state: LeafState, page: number): Promise<void> {
-    await state.document.defaultView!.navigator.clipboard.writeText(`[[${state.file.path}#page=${page}|PDF p.${page}]]`); new Notice('原 PDF 页码链接已复制', 1800);
+    // Follow the vault's link format settings (wikilink/Markdown, path style).
+    const link = this.app.fileManager.generateMarkdownLink(state.file, '', '#page=' + page, 'PDF p.' + page);
+    await state.document.defaultView!.navigator.clipboard.writeText(link); new Notice('原 PDF 页码链接已复制', 1800);
   }
   private assetUrl(cached: CachedReader, reference: string): string {
     const asset = resolveAssetReference(reference, cached.contentBase, cached.assets);
@@ -399,6 +411,8 @@ class ReaderSettingTab extends PluginSettingTab {
     }));
     new Setting(containerEl).setName('正文字号').addSlider(slider => slider.setLimits(16, 24, 1).setValue(this.plugin.settings.fontSize).setDynamicTooltip().onChange(value => { this.plugin.settings.fontSize = value; this.plugin.refreshTypography(); void this.plugin.saveSettings(); }));
     new Setting(containerEl).setName('正文行距').addSlider(slider => slider.setLimits(1.3, 1.8, 0.05).setValue(this.plugin.settings.lineHeight).setDynamicTooltip().onChange(value => { this.plugin.settings.lineHeight = value; this.plugin.refreshTypography(); void this.plugin.saveSettings(); }));
+    new Setting(containerEl).setName('滚动性能诊断').setDesc('排查卡顿时开启：在本地缓存目录记录 performance.json，不含正文且不上传。下次开启阅读模式时生效。')
+      .addToggle(toggle => toggle.setValue(this.plugin.settings.scrollDiagnostics).onChange(value => { this.plugin.settings.scrollDiagnostics = value; void this.plugin.saveSettings(); }));
     containerEl.createEl('p', { text: '阅读模式默认折叠作者及出版信息、参考文献，保留科学脚注与完整图注。旧选区或注释链接会恢复原 PDF 高亮。点击标签页右上角书本图标开始。' });
   }
 }

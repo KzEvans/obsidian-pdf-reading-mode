@@ -474,3 +474,18 @@ test("page tracker reports rebuild attempts and isolated invalidation counters w
     win.cancelAnimationFrame = originalCancel;
   }
 });
+
+test("search text covers reader content but not page markers or source-tool buttons", async () => {
+  const { root } = await render([
+    block("body", "paragraph", "Stress relaxation of transient networks."),
+    block("figure", "figure", "", { captions: ["Fig. 2. Relaxation modulus."] }),
+  ]);
+  const { blockSearchText } = await renderer;
+  const [body, figure] = Array.from(root.querySelectorAll<HTMLElement>("[data-reader-block-id]"));
+  assert.ok(body!.textContent?.includes("原文 p.1"));
+  assert.ok(body!.textContent?.includes("PDF p. 1"));
+  const text = blockSearchText(body!);
+  assert.ok(text.includes("Stress relaxation"));
+  assert.ok(!text.includes("原文") && !text.includes("复制页链") && !text.includes("PDF p."));
+  assert.ok(blockSearchText(figure!).includes("Relaxation modulus"));
+});

@@ -155,6 +155,14 @@ export function scrollToSourcePage(root: HTMLElement, page: number): void {
   root.scrollTop = Math.max(0, top);
 }
 
+/** Reader text of a block, without its page markers or source-tool buttons. */
+export function blockSearchText(block: HTMLElement): string {
+  return Array.from(block.children)
+    .filter((child) => !child.classList.contains("pdf-reader-block-tools") && !child.classList.contains("pdf-reader-page-markers"))
+    .map((child) => child.textContent ?? "")
+    .join(" ");
+}
+
 export interface SourcePageTracker {
   getPage(): number | undefined;
   getStats(): { rebuilds: number; rebuildMs: number; invalidations: Record<string, number> };

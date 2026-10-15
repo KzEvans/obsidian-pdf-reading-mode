@@ -21,7 +21,7 @@ const pluginClass = build({
     builder.onResolve({filter:/^\.\/render$/},()=>({path:'render',namespace:'render-stub'}));
     builder.onLoad({filter:/.*/,namespace:'render-stub'},()=>({contents:`
       export function renderReader() {} export function scrollToSourcePage() {}
-      export function getVisibleSourcePage() {} export function createSourcePageTracker() {}
+      export function getVisibleSourcePage() {} export function createSourcePageTracker() {} export function blockSearchText() { return ''; }
     `}));
   }}],
 }).then(async result => (await import('data:text/javascript;base64,'+Buffer.from(result.outputFiles[0]!.text).toString('base64'))).default);
