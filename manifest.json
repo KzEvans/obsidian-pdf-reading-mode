@@ -1,7 +1,7 @@
 {
   "id": "pdf-reading-mode",
   "name": "PDF Reading Mode",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "minAppVersion": "1.11.4",
   "description": "Read scientific PDFs in a responsive single column with figures, source links and selection translation.",
   "author": "kzevans",

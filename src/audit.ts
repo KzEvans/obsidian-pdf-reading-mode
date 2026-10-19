@@ -45,6 +45,11 @@ export async function auditNativeText(pdf: any, document: ReaderDocument): Promi
     for (const block of pageBlocks) {
       if (document.blocks.includes(block)) restoreBlockSubscripts(block,regions.get(block) ?? []);
     }
+    // pdf.js may split a ligature glyph into its own item ("o ﬀ ers"), so compare letters only.
+    const nativeLetters = native.toLowerCase().replace(/[^a-z]/g, '');
+    for (const block of pageBlocks) {
+      if (document.blocks.includes(block)) restoreLostLigatureF(block, nativeLetters);
+    }
 
     const blocks = document.blocks.filter(block => block.sources.some(source => source.page === page));
     if (!blocks.length) document.warnings.push(`第 ${page} 页没有可用重排内容，请查看原页。`);
@@ -93,6 +98,50 @@ function restoreBlockSubscripts(block: ReaderBlock, regions: string[]): void {
   }
   for (const field of ['captions','footnotes'] as const) {
     if (block[field]) block[field]=block[field]!.map(value=>restoreVerifiedSubscripts(value,regions));
+  }
+}
+
+/** OCR can read an ff/ffi ligature glyph as one f ("ofers", "eficient"). A word is
+ * repaired only when the native page letters, read with its neighbouring words,
+ * lack the cloud spelling and contain exactly one doubled-f spelling. Markup,
+ * TeX and short words stay as-is. */
+function restoreLostLigatureF(block: ReaderBlock, nativeLetters: string): void {
+  if (['metadata','header','footer'].includes(block.kind)) return;
+  const repair = (value: string) => {
+    const tokens = [...value.matchAll(/<[^>]*>|\$\$?[\s\S]*?\$\$?|\\[A-Za-z]+|[A-Za-z]+/g)];
+    const words = tokens.filter(token => /^[A-Za-z]+$/.test(token[0]));
+    const replacements = new Map<number, string>();
+    words.forEach((word, position) => {
+      const token = word[0];
+      if (token.length < 4 || !/f/i.test(token)) return;
+      const lower = token.toLowerCase();
+      const previous = words[position - 1]?.[0].toLowerCase() ?? '';
+      const next = words[position + 1]?.[0].toLowerCase() ?? '';
+      // Widest context first; a short word alone is too common to prove anything.
+      for (const [left, right] of [[previous, next], [previous, ''], ['', next]]) {
+        if (!left && !right) continue;
+        if (nativeLetters.includes(left + lower + right)) return;
+        const candidates = new Set<string>();
+        for (let index = 0; index < token.length; index++) {
+          if (lower[index] !== 'f') continue;
+          const doubled = lower.slice(0, index + 1) + 'f' + lower.slice(index + 1);
+          if (nativeLetters.includes(left + doubled + right)) candidates.add(token.slice(0, index + 1) + 'f' + token.slice(index + 1));
+        }
+        if (candidates.size > 1) return;
+        if (candidates.size === 1) { replacements.set(word.index!, [...candidates][0]!); return; }
+      }
+    });
+    let result = value;
+    for (const [start, replacement] of [...replacements].sort((a, b) => b[0] - a[0])) {
+      result = result.slice(0, start) + replacement + result.slice(start + replacement.length - 1);
+    }
+    return result;
+  };
+  for (const field of ['text','html'] as const) {
+    if (block[field]) block[field] = repair(block[field]!);
+  }
+  for (const field of ['captions','footnotes'] as const) {
+    if (block[field]) block[field] = block[field]!.map(repair);
   }
 }
 

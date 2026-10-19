@@ -165,7 +165,8 @@ test('repeated or ambiguous cloud ff spans retain the native fallback', async ()
     await auditNativeText(pdfFromItems([[nativeItem('The left column has unrelated native wording.',10,80),nativeItem(tail,105,90)]]),doc);
     assert.equal(doc.blocks.length,paragraphs.length+1);
     assert.equal(doc.blocks.at(-1)?.text,tail);
-    assert.equal(doc.blocks[0]?.text,paragraphs[0]);
+    // The lost ligature f is restored word by word; the paragraph is not merged.
+    assert.equal(doc.blocks[0]?.text,paragraphs[0]!.replaceAll('suficiently','sufficiently'));
   }
 });
 
@@ -178,7 +179,8 @@ test('non-ligature letter changes and added cloud f letters cannot remove a nati
     ],'hash','test',1);
     await auditNativeText(pdfFromItems([[nativeItem('The left column has unrelated native wording.',10,80),nativeItem(tail,105,90)]]),doc);
     assert.equal(doc.blocks.length,2);
-    assert.equal(doc.blocks[0]?.text,cloud);
+    // Only a proven lost ligature f is restored; "suffficiently" and "off" stay.
+    assert.equal(doc.blocks[0]?.text,cloud.replace('suficiently','sufficiently'));
     assert.equal(doc.blocks[1]?.text,tail);
   }
 });
@@ -369,4 +371,26 @@ test('repeated ambiguous baseline wording does not trigger a global subscript re
   ];
   await auditNativeText(pdfFromItems([items]),doc);
   assert.equal(doc.blocks[0]?.text,original);
+});
+
+test('a single f lost from an ff/ffi ligature is restored only when the native page proves the word', async () => {
+  const doc = normalizeContentList([
+    {type:'text',text:'Self-organization therefore ofers an eficient pathway; the Efect of stifness is $f_{ef}$ and of <sup>a</sup> Ofice.',page_idx:0,bbox:[0,0,1000,500]},
+    {type:'text',text:'The diference between a lif and a cliff stays as written.',page_idx:0,bbox:[0,500,1000,1000]},
+  ],'hash','test',1);
+  // Native text uses Unicode ligatures, as publisher PDFs do.
+  const pdf=pdfFromItems([[nativeItem('Self-organization therefore oﬀers an eﬃcient pathway; the Eﬀect of stiﬀness is f and of a Oﬃce.'),nativeItem('The diference between a lif and a cliff stays as written, and a different difference too.',10,180)]]);
+  await auditNativeText(pdf,doc);
+  assert.equal(doc.blocks[0]?.text,'Self-organization therefore offers an efficient pathway; the Effect of stiffness is $f_{ef}$ and of <sup>a</sup> Office.');
+  // Words that appear as-is in the native text are never changed.
+  assert.equal(doc.blocks[1]?.text,'The diference between a lif and a cliff stays as written.');
+});
+
+test('ligature words are restored when pdf.js splits the ligature glyph into its own text item', async () => {
+  const doc = normalizeContentList([
+    {type:'text',text:'Self-organization therefore ofers an eficient pathway, and the stifness of the stif network.',page_idx:0,bbox:[0,0,1000,1000]},
+  ],'hash','test',1);
+  const pieces = ['Self-organization therefore o','ﬀ','ers an e','ﬃ','cient pathway, and the sti','ﬀ','ness of the sti','ﬀ',' network.'];
+  await auditNativeText(pdfFromItems([pieces.map(piece=>nativeItem(piece))]),doc);
+  assert.equal(doc.blocks[0]?.text,'Self-organization therefore offers an efficient pathway, and the stiffness of the stiff network.');
 });
