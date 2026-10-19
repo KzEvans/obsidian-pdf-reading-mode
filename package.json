@@ -1,6 +1,6 @@
 {
   "name": "obsidian-pdf-reading-mode",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "description": "Single-column scientific PDF reading inside Obsidian.",
   "scripts": {

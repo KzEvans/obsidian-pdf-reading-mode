@@ -250,22 +250,47 @@ test("first-page publisher controls and tiny icons fold while abstract art stays
   assert.equal(doc.blocks[13]?.kind, "figure");
   assert.equal(doc.blocks[13]?.asset, "abstract.jpg");
   assert.equal(doc.blocks[14]?.kind, "paragraph");
-  assert.equal(doc.blocks[15]?.kind, "figure");
+  // The uncaptioned bottom-right thumbnail is the journal cover, not article content.
+  assert.equal(doc.blocks[15]?.kind, "metadata");
+  assert.equal(doc.blocks[15]?.hiddenByDefault, true);
 });
 
-test("only an explicit provider aside with download user imprint is metadata", () => {
+test("the page-1 journal cover thumbnail folds after the body starts; captioned or larger figures stay", () => {
+  const doc = normalize([
+    { type: "text", text: "Dispersion Polymerization in an Elastomeric Solvent", page_idx: 0, bbox: [80, 135, 721, 158] },
+    { type: "text", text: "ABSTRACT: Polymerization-induced phase separation provides a route.", page_idx: 0, bbox: [77, 292, 507, 473] },
+    { type: "text", text: "1. INTRODUCTION", text_level: 1, page_idx: 0, bbox: [80, 607, 225, 623] },
+    { type: "image", img_path: "cover.jpg", page_idx: 0, bbox: [846, 837, 914, 910] },
+    { type: "image", img_path: "small-figure.jpg", image_caption: ["Figure 1. Particle sizes."], page_idx: 0, bbox: [846, 837, 914, 910] },
+    { type: "image", img_path: "toc.jpg", page_idx: 0, bbox: [518, 760, 914, 930] },
+    { type: "image", img_path: "later.jpg", page_idx: 1, bbox: [846, 837, 914, 910] },
+  ]);
+  const kinds = Object.fromEntries(doc.blocks.filter(block => block.asset).map(block => [block.asset, block.kind]));
+  assert.deepEqual(kinds, { "cover.jpg": "metadata", "small-figure.jpg": "figure", "toc.jpg": "figure", "later.jpg": "figure" });
+});
+
+test("only an explicit provider aside with a download imprint is metadata", () => {
   const imprint = "Downloaded from pubs.acs.org/article-pdf/paper.pdf by ZHEJIANG UNIV user on 26 August 2026";
+  const guest = "Downloaded from pubs.acs.org/mamobx/article-pdf/59/18/9999/68474740/ma-2026-00969.c.pdf by guest on 14 October 2026";
+  const wiley = "Downloaded from https://onlinelibrary.wiley.com/doi/10.1002/adma.202400001 by Zhejiang University, Wiley Online Library on [14/10/2026]. See the Terms and Conditions";
   const doc = normalize([
     { type: "aside_text", text: imprint, page_idx: 4 },
     { type: "aside_text", text: "Downloaded from the instrument after the calibration run.", page_idx: 4 },
     { type: "text", text: "Metrics & More", page_idx: 4 },
     { type: "text", text: "Article", page_idx: 4 },
+    { type: "aside_text", text: guest, page_idx: 5 },
+    { type: "page_aside_text", text: wiley, page_idx: 6 },
+    { type: "text", text: guest, page_idx: 6 },
   ]);
   assert.equal(doc.blocks[0]?.kind, "metadata");
   assert.equal(doc.blocks[0]?.text, imprint);
   assert.equal(doc.blocks[1]?.kind, "paragraph");
   assert.equal(doc.blocks[2]?.kind, "paragraph");
   assert.equal(doc.blocks[3]?.kind, "paragraph");
+  assert.equal(doc.blocks[4]?.kind, "metadata");
+  assert.equal(doc.blocks[5]?.kind, "metadata");
+  // Body text is never reclassified by wording alone.
+  assert.equal(doc.blocks[6]?.kind, "paragraph");
 });
 
 test("in-image OCR before and after a figure becomes alt text without extra source regions", () => {
@@ -388,4 +413,22 @@ test("code with an explicit table caption is a table while ordinary algorithm/co
   assert.equal(doc.blocks[1]?.captions, undefined);
   assert.deepEqual(doc.blocks[2]?.captions, ["表 2：网络参数"]);
   assert.equal(doc.blocks[3]?.text, "return network;");
+});
+
+test("page-1 ACS control labels fold even when the provider lists them after the abstract", () => {
+  const doc = normalize([
+    { type: "text", text: "Dispersion Polymerization in an Elastomeric Solvent", text_level: 1, page_idx: 0 },
+    { type: "text", text: "ACCESS", page_idx: 0 },
+    { type: "text", text: "Metrics & More", page_idx: 0 },
+    { type: "text", text: "ABSTRACT: Polymerization-induced phase separation provides a route.", page_idx: 0 },
+    { type: "text", text: "Article Recommendations", page_idx: 0 },
+    { type: "text", text: "Supporting Information", page_idx: 0 },
+    { type: "text", text: "Supporting Information contains the experimental controls.", page_idx: 0 },
+    { type: "text", text: "Supporting Information", text_level: 1, page_idx: 7 },
+    { type: "text", text: "Article Recommendations", page_idx: 7 },
+  ]);
+  assert.deepEqual(doc.blocks.map(block => block.kind),
+    ["heading", "metadata", "metadata", "paragraph", "metadata", "metadata", "paragraph", "heading", "paragraph"]);
+  assert.equal(doc.blocks[4]?.hiddenByDefault, true);
+  assert.equal(doc.blocks[5]?.hiddenByDefault, true);
 });

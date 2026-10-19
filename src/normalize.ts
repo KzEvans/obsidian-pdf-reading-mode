@@ -3,7 +3,8 @@ import type { ReaderBlock, ReaderBlockKind, ReaderDocument, SourceRef } from "./
 type Item = Record<string, unknown>;
 
 const REFERENCE_TITLE = /^(?:\d+[.)]?\s+)?(?:references|bibliography|literature cited|参考文献)\s*[:：]?$/i;
-const BODY_TITLE = /^(?:\d+[.)]?\s+)?(?:abstract|summary|introduction|keywords?|highlights)\b/i;
+const FIRST_PAGE_CONTROL = /^(?:Read Online|ACCESS|Metrics & More|Article Recommendations|(?:\S{1,4}\s+)?Supporting Information)$/i;
+const BODY_TITLE =/^(?:\d+[.)]?\s+)?(?:abstract|summary|introduction|keywords?|highlights)\b/i;
 const SECTION_AFTER_REFERENCES = /^(?:\d+[.)]?\s+)?(?:acknowledg(?:e)?ments?|appendix(?:\s+[A-Z0-9])?|appendices|supplement(?:al|ary)\s+(?:information|materials?)|supporting information|author contributions?|credit authorship contribution statement|declaration of\s+.{1,70}|conflicts? of interest|data availability(?: statement)?|funding|致谢|附录)\s*[:：]?$/i;
 
 /** Normalize MinerU's cloud Content List V1, without reordering provider blocks. */
@@ -42,7 +43,11 @@ export function normalizeContentList(
     const isSpacedHeading = /^(?:graphicalabstract|abstract|highlights)$/.test(compactHeading);
     const hasHeadingLevel = typeof item.text_level === "number" && item.text_level > 0;
 
-    if (hasHeadingLevel || isReferenceTitle || isNextSection || isSpacedHeading) kind = "heading";
+    // Exact ACS control-bar labels; the provider may list them after the abstract.
+    const isFirstPageControl = sources[0]?.page === 1 && FIRST_PAGE_CONTROL.test(classificationText);
+
+    if (isFirstPageControl) kind = "metadata";
+    else if (hasHeadingLevel || isReferenceTitle || isNextSection || isSpacedHeading) kind = "heading";
     if (kind === "heading") {
       if (isReferenceTitle) inReferences = true;
       else inReferences = false;
@@ -54,7 +59,8 @@ export function normalizeContentList(
       if (
         isPublicationMetadata(classificationText) ||
         (sources[0]?.page === 1 && !seenBody && isFirstPagePublishingUi(classificationText, !seenFirstPageTitle)) ||
-        ((type === "aside_text" || type === "page_aside_text") && /^Downloaded from\s+.+\s+by\s+.+\buser\b/i.test(classificationText))
+        // Publisher margin imprint: a URL or path, then "by <user|guest|institution> ... on <date>".
+        ((type === "aside_text" || type === "page_aside_text") && /^Downloaded from\s+\S*[./]\S*\s+by\s+.+\bon\b/i.test(classificationText))
       ) {
         kind = "metadata";
       } else if (
@@ -93,12 +99,16 @@ export function normalizeContentList(
       if (footnotes.length) block.footnotes = footnotes;
     }
     const logoBox = sources[0]?.bbox;
+    const uncaptionedFirstPageImage = kind === "figure" && sources[0]?.page === 1 &&
+      !text && !block.captions?.length && !block.footnotes?.length && logoBox;
     if (
-      kind === "figure" && sources[0]?.page === 1 && seenFirstPageTitle && !seenBody &&
-      !text && !block.captions?.length && !block.footnotes?.length && logoBox &&
-      (
-        (logoBox[0] > 0.65 && logoBox[3] < 0.35 && logoBox[2] - logoBox[0] < 0.1 && logoBox[3] - logoBox[1] < 0.08) ||
-        (logoBox[2] - logoBox[0] <= 0.05 && logoBox[3] - logoBox[1] <= 0.05)
+      uncaptionedFirstPageImage && (
+        (seenFirstPageTitle && !seenBody && (
+          (logoBox[0] > 0.65 && logoBox[3] < 0.35 && logoBox[2] - logoBox[0] < 0.1 && logoBox[3] - logoBox[1] < 0.08) ||
+          (logoBox[2] - logoBox[0] <= 0.05 && logoBox[3] - logoBox[1] <= 0.05)
+        )) ||
+        // Journal cover thumbnail beside the received/published dates (bottom right).
+        (logoBox[0] > 0.65 && logoBox[1] > 0.75 && logoBox[2] - logoBox[0] < 0.1 && logoBox[3] - logoBox[1] < 0.1)
       )
     ) {
       block.kind = "metadata";
