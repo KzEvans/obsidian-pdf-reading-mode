@@ -8,7 +8,7 @@ import { auditNativeText } from './audit';
 import type { ReaderDocument } from './types';
 
 const API = 'https://mineru.net/api/v4';
-export const CACHE_SIGNATURE = 'mineru-cloud-vlm-content-list-v1-reader-v10';
+export const CACHE_SIGNATURE = 'mineru-cloud-vlm-content-list-v1-reader-v11';
 export const PDF_RESOURCE_OPTIONS = { cMapUrl: '/lib/pdfjs/cmaps/', cMapPacked: true, standardFontDataUrl: '/lib/pdfjs/standard_fonts/', wasmUrl: '/lib/pdfjs/wasm/', iccUrl: '/lib/pdfjs/iccs/', isEvalSupported: false };
 export interface CachedReader { document: ReaderDocument; directory: string; contentBase: string; assets: string[]; assetDimensions?: Record<string, { width: number; height: number }> }
 interface PendingJob { batchId: string; uploaded: boolean }

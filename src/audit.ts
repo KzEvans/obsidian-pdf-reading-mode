@@ -265,6 +265,12 @@ function findDuplicateOwner(blocks: ReaderBlock[], empty: ReaderBlock, regional:
   }))) return undefined;
   for (const candidate of candidates) repairBlockLigatures(candidate, sourceTexts, []);
   const matches = candidates.flatMap(owner => findNativeSpans(owner.text, regional).map(span => ({owner,span})));
+  if (!matches.length) {
+    // Cloud OCR may drop an isolated letter ("monome conversion") inside the copied passage.
+    const native = mapLetters(regional).letters;
+    const owners = candidates.filter(owner => countDroppedLetterMatches(mapLetters(owner.text).letters, native) === 1);
+    return owners.length === 1 ? {owner:owners[0]!} : undefined;
+  }
   if (matches.length !== 1) return undefined;
   const {owner,span} = matches[0]!;
   if (compactText(owner.text).includes(fragment)) return {owner};
@@ -330,6 +336,22 @@ function findNativeSpans(cloud: string, regional: string): NativeSpan[] {
     if (spans.length > 1) break;
   }
   return spans;
+}
+
+/** Count cloud positions holding the native letters minus a few isolated single letters, never added or changed ones. */
+function countDroppedLetterMatches(cloud: string, native: string): number {
+  const allowed = Math.max(1, Math.floor(native.length / 200));
+  let count = 0;
+  for (let start = cloud.indexOf(native.slice(0, 30)); start >= 0 && count < 2; start = cloud.indexOf(native.slice(0, 30), start + 1)) {
+    let dropped = 0, j = start;
+    for (let i = 0; i < native.length && dropped <= allowed; i++) {
+      if (cloud[j] === native[i]) j++;
+      else if (native[i + 1] !== undefined && cloud[j] === native[i + 1]) { dropped++; j++; i++; }
+      else dropped = allowed + 1;
+    }
+    if (dropped <= allowed) count++;
+  }
+  return count;
 }
 
 function replaceUniqueNativeSpan(cloud: string, regional: string, span: NativeSpan): string | undefined {

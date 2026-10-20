@@ -51,6 +51,19 @@ test('empty second-column layout fragment already contained in cloud prose merge
   assert.ok(!doc.warnings.some(warning=>warning.includes('没有可显示内容')));
 });
 
+test('a cloud copy missing one isolated letter still deduplicates the second-column fragment', async () => {
+  const tail = 'Relating polymerization kinetics to particle densities revealed that nucleation ends at 30 min, corresponding to 20% monomer conversion, before particle growth slows.';
+  const full = 'An earlier part of this paragraph describes the specimen. ' + tail.replace('monomer conversion','monome conversion');
+  const doc = normalizeContentList([
+    {type:'text',text:full,page_idx:0,bbox:[0,0,470,350]},
+    {type:'text',text:'',page_idx:0,bbox:[500,0,1000,350]},
+  ],'hash','test',1);
+  await auditNativeText(pdfFromItems([[nativeItem('An earlier part of this paragraph describes the specimen.',10,80),nativeItem(tail,105,90)]]),doc);
+  assert.equal(doc.blocks.length,1);
+  assert.equal(doc.blocks[0]?.text,full);
+  assert.equal(doc.blocks[0]?.sources.length,2);
+});
+
 test('adjacent-page continuation deduplicates across publisher blocks and keeps original page locations', async () => {
   const tail = 'The breakdown strength increases with pre-stretch and the actuator retains its high deformation and mechanical integrity under the applied voltage.';
   const full = 'The previous source page begins this paragraph. ' + tail;
