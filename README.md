@@ -1,5 +1,14 @@
 # PDF Reading Mode for Obsidian
 
+## 后续版本
+
+本插件的后续开发已合并到 [Paper Workbench](https://github.com/KzEvans/obsidian-knowledge-base)，
+统一提供 Zotero 同步、MinerU 解析、Qwen-MT 翻译、单栏阅读和手动笔记生成。
+迁移前请阅读[迁移与回滚方案](https://github.com/KzEvans/obsidian-knowledge-base/blob/main/docs/migration.md)，
+先停用旧插件并保留原目录和缓存；已有 MinerU 结果可复用，无需重新上传。
+本仓库保留旧版 PDF Reading Mode 的源码与使用说明。
+
+
 把文献 PDF 的多栏正文重排为连续单栏，在左右分屏中阅读、划选翻译及跳转原页。
 
 ## 安装
